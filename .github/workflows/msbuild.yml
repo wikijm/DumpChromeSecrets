@@ -1,24 +1,23 @@
-name: Build (MSBuild) – DumpChromeSecrets
+name: CI & Release (MSBuild) – DumpChromeSecrets
 
 on:
   push:
-    branches: [ main ]
+    branches: [ "**" ]     # run automatically on any branch update
     tags:
-      - 'v*.*.*'          # create release when tagging a version (e.g., v1.2.3)
+      - "v*.*.*"           # when tagging, publish a Release
   pull_request:
-    branches: [ main ]
-  workflow_dispatch:
+    branches: [ "**" ]
 
 permissions:
-  contents: read   # least privilege for build; release job requests write later
+  contents: write          # release upload needs write (build reads)
 
 env:
   SOLUTION_FILE_PATH: DumpChromeSecrets.sln
   BUILD_CONFIGURATION: Release
 
 jobs:
-  build-windows:
-    name: Build on Windows (x64)
+  build-and-maybe-release:
+    name: Build (and release if tag)
     runs-on: windows-latest
 
     steps:
@@ -29,14 +28,14 @@ jobs:
         uses: microsoft/setup-msbuild@v2
         with:
           msbuild-architecture: x64
-      # Microsoft action surfaces MSBuild in PATH for later msbuild invocations. [6](https://github.com/microsoft/setup-msbuild/blob/main/action.yml)
+      # Adds msbuild.exe to PATH on Windows runners. [3](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax)
 
       - name: Restore NuGet packages
         run: nuget restore "${{ env.SOLUTION_FILE_PATH }}"
 
       - name: Build solution (Release | x64)
         run: msbuild "${{ env.SOLUTION_FILE_PATH }}" /m /p:Configuration=${{ env.BUILD_CONFIGURATION }} /p:Platform=x64
-      # Starter MSBuild usage pattern on Windows runners. [7](https://github.com/actions/starter-workflows/blob/main/ci/msbuild.yml)
+      # MSBuild invocation pattern from GitHub’s starter workflow. [4](https://www.karimrahal.com/2023/01/05/github-actions-leaking-secrets/)
 
       - name: Locate build outputs
         id: locate
@@ -51,8 +50,8 @@ jobs:
           "exe_path=$($exe.FullName)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           "dll_path=$($dll.FullName)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
-      - name: Generate hashes (SHA256 & SHA512)
-        id: hashes
+      - name: Prepare dist (binaries + hashes + timestamped checksums)
+        id: dist
         shell: pwsh
         run: |
           $outDir = Join-Path $pwd "dist"
@@ -61,19 +60,30 @@ jobs:
           $exe = "${{ steps.locate.outputs.exe_path }}"
           $dll = "${{ steps.locate.outputs.dll_path }}"
 
-          # Compute hashes; SHA256 is default, SHA512 via -Algorithm. [1](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.utility/get-filehash?view=powershell-7.5)[2](https://www.pdq.com/powershell/get-filehash/)
+          # Hash the files (SHA256 + SHA512). Get-FileHash supports both. [1](https://github.com/microsoft/setup-msbuild)
           $exeSha256 = (Get-FileHash -Path $exe -Algorithm SHA256).Hash
           $exeSha512 = (Get-FileHash -Path $exe -Algorithm SHA512).Hash
           $dllSha256 = (Get-FileHash -Path $dll -Algorithm SHA256).Hash
           $dllSha512 = (Get-FileHash -Path $dll -Algorithm SHA512).Hash
 
-          # Write per-file hash sidecars and a combined checksums file
+          # Sidecar hash files
           Set-Content -Path (Join-Path $outDir "DumpChromeSecrets.exe.sha256") -Value $exeSha256
           Set-Content -Path (Join-Path $outDir "DumpChromeSecrets.exe.sha512") -Value $exeSha512
           Set-Content -Path (Join-Path $outDir "DllExtractChromeSecrets.dll.sha256") -Value $dllSha256
           Set-Content -Path (Join-Path $outDir "DllExtractChromeSecrets.dll.sha512") -Value $dllSha512
 
+          # Timestamp (ISO8601 UTC), commit, ref, sizes for provenance
+          $timestampUtc = [DateTime]::UtcNow.ToString("o")    # e.g., 2025-12-30T08:28:05.1234567Z
+          $commit = "${{ github.sha }}"
+          $ref    = "${{ github.ref }}"
+          $exeSize = (Get-Item $exe).Length
+          $dllSize = (Get-Item $dll).Length
+
           $lines = @(
+            "# Checksums generated at (UTC): $timestampUtc"
+            "# Commit: $commit"
+            "# Ref:    $ref"
+            "# File sizes (bytes): DumpChromeSecrets.exe=$exeSize, DllExtractChromeSecrets.dll=$dllSize"
             "SHA256  DumpChromeSecrets.exe  $exeSha256"
             "SHA512  DumpChromeSecrets.exe  $exeSha512"
             "SHA256  DllExtractChromeSecrets.dll  $dllSha256"
@@ -82,48 +92,27 @@ jobs:
           $checksums = Join-Path $outDir "checksums.txt"
           $lines | Set-Content -Path $checksums
 
-          # Copy binaries next to hash files for upload/release
+          # Copy binaries so release uploads them as individual files (not zipped)
           Copy-Item -Path $exe -Destination (Join-Path $outDir "DumpChromeSecrets.exe") -Force
           Copy-Item -Path $dll -Destination (Join-Path $outDir "DllExtractChromeSecrets.dll") -Force
 
           "dist_dir=$outDir" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
-      - name: Upload build artifacts (binaries + hashes)
-        uses: actions/upload-artifact@v4
-        with:
-          name: DumpChromeSecrets-dist
-          path: ${{ steps.hashes.outputs.dist_dir }}
-
-  release:
-    name: Create GitHub Release with binaries & hashes
-    # Run this job only when building a tag like v1.2.3.
-    if: startsWith(github.ref, 'refs/tags/')
-    needs: build-windows
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write   # needed to create releases and upload assets
-
-    steps:
-      - name: Download dist artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: DumpChromeSecrets-dist
-          path: dist
-
-      - name: Create/Update Release (tag-gated)
-        id: gh_release
+      - name: Create/Update GitHub Release (tag only; separate files)
+        if: github.ref_type == 'tag'
         uses: softprops/action-gh-release@v2
         with:
-          # Upload binaries and hash files as release assets. Paths use '/' on all runners. [3](https://github.com/softprops/action-gh-release)[4](https://github.com/softprops/action-gh-release/blob/master/README.md)
           files: |
-            dist/DumpChromeSecrets.exe
-            dist/DllExtractChromeSecrets.dll
-            dist/DumpChromeSecrets.exe.sha256
-            dist/DumpChromeSecrets.exe.sha512
-            dist/DllExtractChromeSecrets.dll.sha256
-            dist/DllExtractChromeSecrets.dll.sha512
-            dist/checksums.txt
+            ${{ steps.dist.outputs.dist_dir }}/DumpChromeSecrets.exe
+            ${{ steps.dist.outputs.dist_dir }}/DllExtractChromeSecrets.dll
+            ${{ steps.dist.outputs.dist_dir }}/DumpChromeSecrets.exe.sha256
+            ${{ steps.dist.outputs.dist_dir }}/DumpChromeSecrets.exe.sha512
+            ${{ steps.dist.outputs.dist_dir }}/DllExtractChromeSecrets.dll.sha256
+            ${{ steps.dist.outputs.dist_dir }}/DllExtractChromeSecrets.dll.sha512
+            ${{ steps.dist.outputs.dist_dir }}/checksums.txt
           draft: false
           prerelease: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      
+      # Release assets are uploaded as-is; no ZIP wrapping. [2](https://cicube.io/blog/github-actions-secrets/)
