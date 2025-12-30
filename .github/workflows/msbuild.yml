@@ -1,44 +1,106 @@
-# This workflow uses actions that are not certified by GitHub.
-# They are provided by a third-party and are governed by
-# separate terms of service, privacy policy, and support
-# documentation.
 
-name: MSBuild
+name: Build (MSBuild) – DumpChromeSecrets
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [ main ]
   pull_request:
-    branches: [ "main" ]
-
-env:
-  # Path to the solution file relative to the root of the project.
-  SOLUTION_FILE_PATH: .
-
-  # Configuration type to build.
-  # You can convert this to a build matrix if you need coverage of multiple configuration types.
-  # https://docs.github.com/actions/learn-github-actions/managing-complex-workflows#using-a-build-matrix
-  BUILD_CONFIGURATION: Release
+    branches: [ main ]
+  workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: read   # least-privilege for build; release job will request write later
+
+env:
+  SOLUTION_FILE_PATH: DumpChromeSecrets.sln
+  BUILD_CONFIGURATION: Release
 
 jobs:
-  build:
+  build-windows:
+    name: Build on Windows (x64)
     runs-on: windows-latest
 
     steps:
-    - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-    - name: Add MSBuild to PATH
-      uses: microsoft/setup-msbuild@v2
+      - name: Add MSBuild to PATH
+        uses: microsoft/setup-msbuild@v2
+        with:
+          msbuild-architecture: x64
+      # Ref: action parameters & behavior. [2](https://github.com/microsoft/setup-msbuild/blob/main/action.yml)
 
-    - name: Restore NuGet packages
-      working-directory: ${{env.GITHUB_WORKSPACE}}
-      run: nuget restore ${{env.SOLUTION_FILE_PATH}}
+      - name: Restore NuGet packages
+        run: nuget restore "${{ env.SOLUTION_FILE_PATH }}"
 
-    - name: Build
-      working-directory: ${{env.GITHUB_WORKSPACE}}
-      # Add additional options to the MSBuild command line here (like platform or verbosity level).
-      # See https://docs.microsoft.com/visualstudio/msbuild/msbuild-command-line-reference
-      run: msbuild /m /p:Configuration=${{env.BUILD_CONFIGURATION}} ${{env.SOLUTION_FILE_PATH}}
+      - name: Build solution (Release | x64)
+        run: msbuild "${{ env.SOLUTION_FILE_PATH }}" /m /p:Configuration=${{ env.BUILD_CONFIGURATION }} /p:Platform=x64
+        # Starter pattern for MSBuild usage in Actions. [3](https://github.com/actions/starter-workflows/blob/main/ci/msbuild.yml)
+
+      - name: Locate build outputs
+        id: locate
+        shell: pwsh
+        run: |
+          # Try common output folders from VS/MSBuild for C++/C# projects
+          $exe = Get-ChildItem -Recurse -File -Filter DumpChromeSecrets.exe | Where-Object { $_.FullName -match '\\bin\\Release\\|\\x64\\Release\\' } | Select-Object -First 1
+          $dll = Get-ChildItem -Recurse -File -Filter DllExtractChromeSecrets.dll | Where-Object { $_.FullName -match '\\bin\\Release\\|\\x64\\Release\\' } | Select-Object -First 1
+
+          if (-not $exe) { throw "DumpChromeSecrets.exe not found in typical Release folders." }
+          if (-not $dll) { throw "DllExtractChromeSecrets.dll not found in typical Release folders." }
+
+          "exe_path=$($exe.FullName)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "dll_path=$($dll.FullName)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Upload EXE artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DumpChromeSecrets.exe
+          path: ${{ steps.locate.outputs.exe_path }}
+
+      - name: Upload DLL artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DllExtractChromeSecrets.dll
+          path: ${{ steps.locate.outputs.dll_path }}
+
+  # Optional: create a Release and attach the compiled binaries when manually triggered
+  release:
+    name: Create GitHub Release with artifacts
+    if: github.event_name == 'workflow_dispatch'
+    needs: build-windows
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # needed to create releases
+
+    steps:
+      - name: Download EXE
+        uses: actions/download-artifact@v4
+        with:
+          name: DumpChromeSecrets.exe
+          path: dist
+
+      - name: Download DLL
+        uses: actions/download-artifact@v4
+        with:
+          name: DllExtractChromeSecrets.dll
+          path: dist
+
+      - name: Create Release
+        id: create_release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ github.run_number }}
+          name: Build ${{ github.run_number }}
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload Assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/DumpChromeSecrets.exe
+            dist/DllExtractChromeSecrets.dll
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
