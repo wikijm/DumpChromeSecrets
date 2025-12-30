@@ -1,15 +1,16 @@
-
 name: Build (MSBuild) – DumpChromeSecrets
 
 on:
   push:
     branches: [ main ]
+    tags:
+      - 'v*.*.*'          # create release when tagging a version (e.g., v1.2.3)
   pull_request:
     branches: [ main ]
   workflow_dispatch:
 
 permissions:
-  contents: read   # least-privilege for build; release job will request write later
+  contents: read   # least privilege for build; release job requests write later
 
 env:
   SOLUTION_FILE_PATH: DumpChromeSecrets.sln
@@ -28,20 +29,19 @@ jobs:
         uses: microsoft/setup-msbuild@v2
         with:
           msbuild-architecture: x64
-      # Ref: action parameters & behavior. [2](https://github.com/microsoft/setup-msbuild/blob/main/action.yml)
+      # Microsoft action surfaces MSBuild in PATH for later msbuild invocations. [6](https://github.com/microsoft/setup-msbuild/blob/main/action.yml)
 
       - name: Restore NuGet packages
         run: nuget restore "${{ env.SOLUTION_FILE_PATH }}"
 
       - name: Build solution (Release | x64)
         run: msbuild "${{ env.SOLUTION_FILE_PATH }}" /m /p:Configuration=${{ env.BUILD_CONFIGURATION }} /p:Platform=x64
-        # Starter pattern for MSBuild usage in Actions. [3](https://github.com/actions/starter-workflows/blob/main/ci/msbuild.yml)
+      # Starter MSBuild usage pattern on Windows runners. [7](https://github.com/actions/starter-workflows/blob/main/ci/msbuild.yml)
 
       - name: Locate build outputs
         id: locate
         shell: pwsh
         run: |
-          # Try common output folders from VS/MSBuild for C++/C# projects
           $exe = Get-ChildItem -Recurse -File -Filter DumpChromeSecrets.exe | Where-Object { $_.FullName -match '\\bin\\Release\\|\\x64\\Release\\' } | Select-Object -First 1
           $dll = Get-ChildItem -Recurse -File -Filter DllExtractChromeSecrets.dll | Where-Object { $_.FullName -match '\\bin\\Release\\|\\x64\\Release\\' } | Select-Object -First 1
 
@@ -51,56 +51,79 @@ jobs:
           "exe_path=$($exe.FullName)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           "dll_path=$($dll.FullName)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
-      - name: Upload EXE artifact
+      - name: Generate hashes (SHA256 & SHA512)
+        id: hashes
+        shell: pwsh
+        run: |
+          $outDir = Join-Path $pwd "dist"
+          New-Item -ItemType Directory -Force -Path $outDir | Out-Null
+
+          $exe = "${{ steps.locate.outputs.exe_path }}"
+          $dll = "${{ steps.locate.outputs.dll_path }}"
+
+          # Compute hashes; SHA256 is default, SHA512 via -Algorithm. [1](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.utility/get-filehash?view=powershell-7.5)[2](https://www.pdq.com/powershell/get-filehash/)
+          $exeSha256 = (Get-FileHash -Path $exe -Algorithm SHA256).Hash
+          $exeSha512 = (Get-FileHash -Path $exe -Algorithm SHA512).Hash
+          $dllSha256 = (Get-FileHash -Path $dll -Algorithm SHA256).Hash
+          $dllSha512 = (Get-FileHash -Path $dll -Algorithm SHA512).Hash
+
+          # Write per-file hash sidecars and a combined checksums file
+          Set-Content -Path (Join-Path $outDir "DumpChromeSecrets.exe.sha256") -Value $exeSha256
+          Set-Content -Path (Join-Path $outDir "DumpChromeSecrets.exe.sha512") -Value $exeSha512
+          Set-Content -Path (Join-Path $outDir "DllExtractChromeSecrets.dll.sha256") -Value $dllSha256
+          Set-Content -Path (Join-Path $outDir "DllExtractChromeSecrets.dll.sha512") -Value $dllSha512
+
+          $lines = @(
+            "SHA256  DumpChromeSecrets.exe  $exeSha256"
+            "SHA512  DumpChromeSecrets.exe  $exeSha512"
+            "SHA256  DllExtractChromeSecrets.dll  $dllSha256"
+            "SHA512  DllExtractChromeSecrets.dll  $dllSha512"
+          )
+          $checksums = Join-Path $outDir "checksums.txt"
+          $lines | Set-Content -Path $checksums
+
+          # Copy binaries next to hash files for upload/release
+          Copy-Item -Path $exe -Destination (Join-Path $outDir "DumpChromeSecrets.exe") -Force
+          Copy-Item -Path $dll -Destination (Join-Path $outDir "DllExtractChromeSecrets.dll") -Force
+
+          "dist_dir=$outDir" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Upload build artifacts (binaries + hashes)
         uses: actions/upload-artifact@v4
         with:
-          name: DumpChromeSecrets.exe
-          path: ${{ steps.locate.outputs.exe_path }}
+          name: DumpChromeSecrets-dist
+          path: ${{ steps.hashes.outputs.dist_dir }}
 
-      - name: Upload DLL artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: DllExtractChromeSecrets.dll
-          path: ${{ steps.locate.outputs.dll_path }}
-
-  # Optional: create a Release and attach the compiled binaries when manually triggered
   release:
-    name: Create GitHub Release with artifacts
-    if: github.event_name == 'workflow_dispatch'
+    name: Create GitHub Release with binaries & hashes
+    # Run this job only when building a tag like v1.2.3.
+    if: startsWith(github.ref, 'refs/tags/')
     needs: build-windows
     runs-on: ubuntu-latest
     permissions:
-      contents: write   # needed to create releases
+      contents: write   # needed to create releases and upload assets
 
     steps:
-      - name: Download EXE
+      - name: Download dist artifact
         uses: actions/download-artifact@v4
         with:
-          name: DumpChromeSecrets.exe
+          name: DumpChromeSecrets-dist
           path: dist
 
-      - name: Download DLL
-        uses: actions/download-artifact@v4
-        with:
-          name: DllExtractChromeSecrets.dll
-          path: dist
-
-      - name: Create Release
-        id: create_release
+      - name: Create/Update Release (tag-gated)
+        id: gh_release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v${{ github.run_number }}
-          name: Build ${{ github.run_number }}
-          draft: false
-          prerelease: false
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Upload Assets
-        uses: softprops/action-gh-release@v2
-        with:
+          # Upload binaries and hash files as release assets. Paths use '/' on all runners. [3](https://github.com/softprops/action-gh-release)[4](https://github.com/softprops/action-gh-release/blob/master/README.md)
           files: |
             dist/DumpChromeSecrets.exe
             dist/DllExtractChromeSecrets.dll
+            dist/DumpChromeSecrets.exe.sha256
+            dist/DumpChromeSecrets.exe.sha512
+            dist/DllExtractChromeSecrets.dll.sha256
+            dist/DllExtractChromeSecrets.dll.sha512
+            dist/checksums.txt
+          draft: false
+          prerelease: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
